@@ -1,39 +1,86 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-BASE_URL="https://raw.githubusercontent.com/Fin12n/Linux/refs/heads/main/Antigravity/scripts"
+REPO_RAW_BASE="https://raw.githubusercontent.com/Fin12n/Linux/refs/heads/main/Antigravity/scripts"
 
-# Detect OS
-source /etc/os-release
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
 
-case "$ID" in
+command -v curl >/dev/null 2>&1 || die "Không tìm thấy curl."
 
-    ubuntu|debian|linuxmint|pop|elementary|zorin)
-        SCRIPT_URL="$BASE_URL/install-ubuntu.sh"
+detect_os() {
+    [[ -f /etc/os-release ]] || die "Không tìm thấy /etc/os-release."
+
+    # shellcheck disable=SC1091
+    source /etc/os-release
+
+    case "${ID:-}" in
+        ubuntu)
+            echo "ubuntu"
+            ;;
+        debian)
+            echo "ubuntu"
+            ;;
+        linuxmint)
+            echo "ubuntu"
+            ;;
+        pop)
+            echo "ubuntu"
+            ;;
+        fedora)
+            echo "fedora"
+            ;;
+        rhel)
+            echo "fedora"
+            ;;
+        rocky)
+            echo "fedora"
+            ;;
+        almalinux)
+            echo "fedora"
+            ;;
+        *)
+            case "${ID_LIKE:-}" in
+                *debian*)
+                    echo "ubuntu"
+                    ;;
+                *fedora*|*rhel*)
+                    echo "fedora"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+OS="$(detect_os)" || die "Hệ điều hành chưa được hỗ trợ."
+
+echo "Detected OS: ${PRETTY_NAME:-$OS}"
+
+case "$OS" in
+    ubuntu)
+        SCRIPT_URL="${REPO_RAW_BASE}/install-ubuntu.sh"
         ;;
-
-    fedora|rhel|centos|rocky|almalinux)
-        SCRIPT_URL="$BASE_URL/install-fedora.sh"
-        ;;
-
-    *)
-        if [[ "${ID_LIKE:-}" == *debian* ]]; then
-            SCRIPT_URL="$BASE_URL/install-ubuntu.sh"
-
-        elif [[ "${ID_LIKE:-}" == *fedora* ||
-                "${ID_LIKE:-}" == *rhel* ]]; then
-            SCRIPT_URL="$BASE_URL/install-fedora.sh"
-
-        else
-            echo "ERROR: OS chưa được hỗ trợ."
-            exit 1
-        fi
+    fedora)
+        SCRIPT_URL="${REPO_RAW_BASE}/install-fedora.sh"
         ;;
 esac
 
-echo "Detected OS: ${PRETTY_NAME:-$ID}"
 echo "Downloading installer..."
+echo
 
-exec bash <(
-    curl -fsSL "$SCRIPT_URL"
-)
+TMP_SCRIPT="$(mktemp)"
+trap 'rm -f "$TMP_SCRIPT"' EXIT
+
+curl -fL --retry 3 --retry-delay 1 \
+    "$SCRIPT_URL" \
+    -o "$TMP_SCRIPT" \
+    || die "Không tải được installer: $SCRIPT_URL"
+
+chmod +x "$TMP_SCRIPT"
+
+exec bash "$TMP_SCRIPT" "$@"
