@@ -1,611 +1,534 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 APP_NAME="Antigravity IDE"
-
-APP_DIR="/opt/antigravity-ide"
+INSTALL_DIR="/opt/antigravity-ide"
 BIN_PATH="/usr/local/bin/antigravity-ide"
-
 DESKTOP_FILE="$HOME/.local/share/applications/antigravity.desktop"
-DESKTOP_LINK="$HOME/Desktop/Antigravity IDE.desktop"
+DESKTOP_SHORTCUT="$HOME/Desktop/antigravity.desktop"
 
-RELEASES_URL="https://antigravity.google/releases/"
-
-TMP_DIR=""
-WORK_DIR=""
+RELEASE_URL="https://antigravity.google/releases/"
+TMP_ROOT="$(mktemp -d)"
 
 cleanup() {
-    if [[ -n "${TMP_DIR:-}" && -d "$TMP_DIR" ]]; then
-        rm -rf "$TMP_DIR"
-    fi
+    rm -rf "$TMP_ROOT"
 }
-
 trap cleanup EXIT
 
-
 die() {
-    echo
     echo "ERROR: $*" >&2
     exit 1
 }
 
-
-info() {
-    echo
-    echo "==> $*"
+log() {
+    echo "$*"
 }
 
-
-warn() {
-    echo
-    echo "WARNING: $*" >&2
+need_command() {
+    command -v "$1" >/dev/null 2>&1
 }
-
 
 install_dependencies() {
-
     local missing=()
 
-    command -v curl >/dev/null 2>&1 || missing+=(curl)
-    command -v tar >/dev/null 2>&1 || missing+=(tar)
-    command -v python3 >/dev/null 2>&1 || missing+=(python3)
-    command -v restorecon >/dev/null 2>&1 || missing+=(policycoreutils)
+    need_command curl || missing+=("curl")
+    need_command tar || missing+=("tar")
+    need_command python3 || missing+=("python3")
 
-
-    if ((${#missing[@]})); then
-
-        info "Cài dependency: ${missing[*]}"
-
-        sudo dnf install -y \
-            "${missing[@]}"
-
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return
     fi
-}
 
+    echo
+    echo "Thiếu dependency: ${missing[*]}"
+    echo "Đang cài dependency..."
+    echo
+
+    sudo dnf install -y "${missing[@]}"
+}
 
 version_from_dir() {
-
     local dir="$1"
-    local f=""
+    local version=""
 
-    for f in \
-        "$dir/resources/app/package.json" \
-        "$dir/resources/app/product.json" \
-        "$dir/resources/package.json" \
-        "$dir/package.json"
-    do
-
-        if [[ -f "$f" ]]; then
-
-            if command -v python3 >/dev/null 2>&1; then
-
-                python3 - "$f" <<'PY'
-
+    version="$(
+        python3 - "$dir" <<'PY'
 import json
+import os
 import sys
 
+root = sys.argv[1]
 
-path = sys.argv[1]
+files = [
+    os.path.join(root, "resources", "app", "package.json"),
+    os.path.join(root, "resources", "app", "product.json"),
+    os.path.join(root, "resources", "package.json"),
+    os.path.join(root, "package.json"),
+]
 
+for path in files:
+    if not os.path.isfile(path):
+        continue
 
-try:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    with open(
-        path,
-        encoding="utf-8"
-    ) as f:
-
-        data = json.load(f)
-
-
-    for key in (
-        "version",
-        "productVersion"
-    ):
-
-        value = data.get(key)
-
-
-        if (
-            isinstance(value, str)
-            and value.strip()
-        ):
-
-            print(value.strip())
-
-            raise SystemExit(0)
-
-
-except Exception:
-    pass
-
+        for key in ("version", "buildVersion", "productVersion"):
+            value = data.get(key)
+            if value:
+                print(str(value))
+                raise SystemExit(0)
+    except Exception:
+        pass
 PY
+    )"
 
-                return 0
+    echo "$version"
+}
 
-            fi
+version_from_archive() {
+    local archive="$1"
+    local temp_dir="$TMP_ROOT/version-check"
 
+    rm -rf "$temp_dir"
+    mkdir -p "$temp_dir"
 
-            sed -n \
-                's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-                "$f" |
-                head -n1
+    tar -xzf "$archive" -C "$temp_dir"
 
+    local root="$temp_dir"
 
-            return 0
+    local dirs=()
+    while IFS= read -r -d '' d; do
+        dirs+=("$d")
+    done < <(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d -print0)
 
-        fi
-
-    done
-
-
-    if [[ -x "$dir/antigravity-ide" ]]; then
-
-        "$dir/antigravity-ide" \
-            --version \
-            2>/dev/null |
-            head -n1 ||
-            true
-
+    if [[ ${#dirs[@]} -eq 1 ]]; then
+        root="${dirs[0]}"
     fi
+
+    version_from_dir "$root"
 }
 
-
-installed_version() {
-
-    [[ -d "$APP_DIR" ]] ||
-        return 0
-
-    version_from_dir "$APP_DIR" ||
-        true
-}
-
-
-discover_release() {
-
-    local html="$WORK_DIR/releases.html"
-
-
-    info "Đang lấy trang releases chính thức..."
-
-
-    curl \
-        -fL \
-        --retry 3 \
-        --connect-timeout 15 \
-        -A "Mozilla/5.0" \
-        "$RELEASES_URL" \
-        -o "$html" ||
-        die "Không tải được $RELEASES_URL"
-
-
-    if command -v python3 >/dev/null 2>&1; then
-
-        python3 - "$html" <<'PY'
-
-import html as H
+version_compare() {
+    python3 - "$1" "$2" <<'PY'
 import re
 import sys
 
-from urllib.parse import urljoin
+a = sys.argv[1].strip()
+b = sys.argv[2].strip()
 
+def normalize(v):
+    nums = re.findall(r'\d+', v)
+    return tuple(int(x) for x in nums)
+
+va = normalize(a)
+vb = normalize(b)
+
+if va < vb:
+    print("1")
+elif va > vb:
+    print("2")
+else:
+    print("0")
+PY
+}
+
+extract_release_page() {
+    local output="$TMP_ROOT/releases.html"
+
+    log "==> Đang lấy trang releases chính thức..." >&2
+
+    curl -fL --retry 3 --retry-delay 1 \
+        -A "Mozilla/5.0" \
+        "$RELEASE_URL" \
+        -o "$output" \
+        || die "Không tải được trang releases."
+
+    [[ -s "$output" ]] || die "Trang releases rỗng."
+
+    echo "$output"
+}
+
+discover_release() {
+    local html="$1"
+
+    python3 - "$html" <<'PY'
+import html
+import re
+import sys
+from urllib.parse import urljoin
 
 path = sys.argv[1]
 
+with open(path, "r", encoding="utf-8", errors="ignore") as f:
+    raw = f.read()
 
-with open(
-    path,
-    encoding="utf-8",
-    errors="ignore"
-) as f:
+BASE = "https://antigravity.google/releases/"
 
-    data = f.read()
+def clean_html(s):
+    s = re.sub(r'(?is)<script\b.*?</script>', ' ', s)
+    s = re.sub(r'(?is)<style\b.*?</style>', ' ', s)
+    s = re.sub(r'(?is)<!--.*?-->', ' ', s)
+    s = re.sub(r'(?s)<[^>]+>', ' ', s)
+    s = html.unescape(s)
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
 
+anchors = []
 
-data = H.unescape(data)
-
-
-anchors = re.findall(
-    r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-    data,
-    flags=re.I | re.S
+anchor_re = re.compile(
+    r'(?is)<a\b[^>]*href\s*=\s*([\'"])(.*?)\1[^>]*>(.*?)</a>'
 )
 
+for m in anchor_re.finditer(raw):
+    href = html.unescape(m.group(2)).strip()
+    text = clean_html(m.group(3))
 
-candidates = []
-
-
-for href, text in anchors:
-
-    visible = re.sub(
-        r'<[^>]+>',
-        ' ',
-        text
-    )
-
-    visible = ' '.join(
-        H.unescape(visible).split()
-    )
-
-
-    blob = (
-        href +
-        " " +
-        visible
-    ).lower()
-
-
-    if "antigravity" not in blob:
+    if not href:
         continue
 
+    anchors.append({
+        "href": urljoin(BASE, href),
+        "text": text,
+        "start": m.start(),
+        "end": m.end(),
+    })
 
-    if not re.search(
-        r'\.(?:tar\.gz|tgz)(?:[?#].*)?$',
-        href,
-        re.I
-    ):
-        continue
+urls = set()
 
-
-    if not any(
-        x in blob
-        for x in (
-            "linux",
-            "x64",
-            "amd64"
-        )
-    ):
-        continue
-
-
-    if any(
-        x in blob
-        for x in (
-            "arm64",
-            "aarch64",
-            "armv7"
-        )
-    ):
-        continue
-
-
-    candidates.append(
-        (
-            urljoin(
-                "https://antigravity.google/",
-                href
-            ),
-            visible
-        )
-    )
-
-
-# Embedded URLs / JSON.
-for match in re.finditer(
-    r'https?://[^"\'<>\s]+',
-    data
+for m in re.finditer(
+    r'https?://[^"\'<>\s]+?\.(?:tar\.gz|tgz)(?:\?[^"\'<>\s]*)?',
+    raw,
+    re.I
 ):
+    urls.add(html.unescape(m.group(0)))
 
-    url = H.unescape(
-        match.group(0)
-    )
+for m in re.finditer(
+    r'["\']([^"\']+\.(?:tar\.gz|tgz)(?:\?[^"\']*)?)["\']',
+    raw,
+    re.I
+):
+    urls.add(urljoin(BASE, html.unescape(m.group(1))))
 
+for u in urls:
+    if not any(a["href"] == u for a in anchors):
+        anchors.append({
+            "href": u,
+            "text": "",
+            "start": 0,
+            "end": 0,
+        })
 
-    blob = url.lower()
+heading_re = re.compile(
+    r'(?is)<(?:h1|h2|h3|h4|h5|h6)\b[^>]*>(.*?)</(?:h1|h2|h3|h4|h5|h6)>'
+)
 
+headings = []
 
-    if "antigravity" not in blob:
+for m in heading_re.finditer(raw):
+    txt = clean_html(m.group(1))
+    if txt:
+        headings.append((m.start(), m.end(), txt))
+
+def context_for(pos):
+    previous = [h for h in headings if h[0] <= pos]
+    if not previous:
+        return ""
+    return " ".join(h[2] for h in previous[-4:])
+
+def score_candidate(a):
+    href = a["href"].lower()
+    text = a["text"].lower()
+    ctx = context_for(a["start"]).lower()
+
+    blob = f"{href} {text} {ctx}"
+
+    if not re.search(r'\.(?:tar\.gz|tgz)(?:\?|$)', href):
+        return -999999
+
+    score = 0
+
+    if "antigravity" in href:
+        score += 100
+
+    if "antigravity" in text:
+        score += 150
+
+    if "antigravity" in ctx:
+        score += 200
+
+    if re.search(r'\bantigravity\s+ide\b', blob):
+        score += 300
+    elif re.search(r'\bide\b', blob):
+        score += 20
+
+    if re.search(r'\blinux\b', blob):
+        score += 150
+
+    if re.search(r'\b(x86[_-]?64|amd64|x64)\b', blob):
+        score += 150
+
+    if re.search(r'\b(x64|amd64)\b', href):
+        score += 100
+
+    if re.search(r'\b(arm64|aarch64|armv7|armhf|arm)\b', blob):
+        score -= 1000
+
+    if re.search(r'\b(windows|win32|win64|darwin|macos|mac)\b', blob):
+        score -= 1000
+
+    if re.search(r'\b(source|src|debug|symbols)\b', blob):
+        score -= 300
+
+    if re.search(r'\d+\.\d+\.\d+', href):
+        score += 30
+
+    return score
+
+ranked = []
+
+for a in anchors:
+    score = score_candidate(a)
+
+    if score <= -999999:
         continue
 
+    ranked.append((score, a))
 
-    if not re.search(
-        r'\.(?:tar\.gz|tgz)(?:[?#].*)?$',
-        url,
-        re.I
-    ):
-        continue
+ranked.sort(
+    key=lambda x: (
+        x[0],
+        len(x[1]["text"]),
+        x[1]["href"],
+    ),
+    reverse=True
+)
 
-
-    if not any(
-        x in blob
-        for x in (
-            "linux",
-            "x64",
-            "amd64"
-        )
-    ):
-        continue
-
-
-    if any(
-        x in blob
-        for x in (
-            "arm64",
-            "aarch64",
-            "armv7"
-        )
-    ):
-        continue
-
-
-    candidates.append(
-        (
-            url,
-            "embedded URL"
-        )
-    )
-
-
-# Deduplicate.
-seen = set()
-unique = []
-
-
-for url, text in candidates:
-
-    if url not in seen:
-
-        seen.add(url)
-
-        unique.append(
-            (
-                url,
-                text
-            )
-        )
-
-
-if len(unique) == 1:
-
-    print(unique[0][0])
-
-    raise SystemExit(0)
-
-
-if len(unique) > 1:
-
-    ranked = sorted(
-        unique,
-        key=lambda item: (
-            "linux" not in item[1].lower(),
-
-            not bool(
-                re.search(
-                    r'\b(x64|amd64)\b',
-                    item[1],
-                    re.I
-                )
-            )
-        )
-    )
-
-
-    if (
-        len(ranked) == 1
-        or ranked[0][1] != ranked[1][1]
-    ):
-
-        print(ranked[0][0])
-
-        raise SystemExit(0)
-
-
-print("AMBIGUOUS")
-
-
-for url, text in unique[:10]:
-
+if not ranked:
     print(
-        url +
-        "\t" +
-        text
+        "Không tìm thấy archive Linux x64 của Antigravity IDE.",
+        file=sys.stderr
     )
 
+    print("", file=sys.stderr)
+    print("Các archive tar.gz/tgz tìm được:", file=sys.stderr)
+
+    seen = set()
+
+    for a in anchors:
+        u = a["href"]
+
+        if u in seen:
+            continue
+
+        seen.add(u)
+
+        if re.search(r'\.(?:tar\.gz|tgz)(?:\?|$)', u, re.I):
+            print("  " + u, file=sys.stderr)
+
+    sys.exit(2)
+
+best_score, best = ranked[0]
+
+if best_score < 250:
+    print(
+        "Không đủ chắc chắn để xác định archive Antigravity IDE.",
+        file=sys.stderr
+    )
+
+    print("", file=sys.stderr)
+    print("Top candidates:", file=sys.stderr)
+
+    for score, a in ranked[:10]:
+        print(
+            f"  score={score:4d} | "
+            f"{a['text'][:80]} | "
+            f"{a['href']}",
+            file=sys.stderr
+        )
+
+    sys.exit(2)
+
+if len(ranked) >= 2:
+    second_score = ranked[1][0]
+
+    if best_score == second_score:
+        print(
+            "Có nhiều archive có cùng độ ưu tiên; không tự đoán.",
+            file=sys.stderr
+        )
+
+        for score, a in ranked[:10]:
+            print(
+                f"  score={score:4d} | "
+                f"{a['text'][:80]} | "
+                f"{a['href']}",
+                file=sys.stderr
+            )
+
+        sys.exit(2)
+
+# stdout chỉ có URL.
+print(best["href"])
 PY
-
-        return 0
-
-    fi
-
-
-    grep -Eo \
-        'https?://[^"'\'' <>()]+\.tar\.gz' \
-        "$html" 2>/dev/null |
-        grep -Ei \
-            'antigravity.*(linux|x64|amd64)|(linux|x64|amd64).*antigravity' |
-        grep -Eiv \
-            'arm64|aarch64|armv7' |
-        head -n1 ||
-        true
 }
-
 
 download_latest() {
-
     local url="$1"
+    local output="$TMP_ROOT/antigravity.tar.gz"
 
-    local archive="$WORK_DIR/antigravity.tar.gz"
-
-
-    info "Artifact:"
-    echo "$url"
+    log "==> Download:"
+    log "$url"
     echo
 
-
-    curl \
-        -fL \
-        --retry 3 \
-        --connect-timeout 15 \
+    curl -fL --retry 3 --retry-delay 1 \
         -A "Mozilla/5.0" \
         "$url" \
-        -o "$archive" ||
-        die "Download thất bại."
+        -o "$output" \
+        || die "Download thất bại."
 
+    [[ -s "$output" ]] || die "File download rỗng."
 
-    [[ -s "$archive" ]] ||
-        die "File tải về rỗng."
-
-
-    echo "$archive"
+    echo "$output"
 }
 
+installed_version() {
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        echo ""
+        return
+    fi
+
+    version_from_dir "$INSTALL_DIR"
+}
+
+confirm() {
+    local question="$1"
+
+    read -r -p "$question [y/N]: " answer
+
+    case "$answer" in
+        y|Y|yes|YES)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 install_archive() {
-
     local archive="$1"
+    local new_dir="$TMP_ROOT/new-install"
 
-    local extract_dir="$WORK_DIR/extracted"
+    rm -rf "$new_dir"
+    mkdir -p "$new_dir"
 
+    log "==> Giải nén..."
 
-    mkdir -p "$extract_dir"
+    tar -xzf "$archive" -C "$new_dir"
 
+    local source_dir="$new_dir"
 
-    tar \
-        -xzf "$archive" \
-        -C "$extract_dir" ||
-        die "Không giải nén được archive."
+    local dirs=()
 
+    while IFS= read -r -d '' d; do
+        dirs+=("$d")
+    done < <(
+        find "$new_dir" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -print0
+    )
 
-    local source=""
-
-
-    if [[ -x "$extract_dir/antigravity-ide" ]]; then
-
-        source="$extract_dir"
-
-    else
-
-        source="$(
-            find "$extract_dir" \
-                -mindepth 1 \
-                -maxdepth 2 \
-                -type f \
-                -name antigravity-ide \
-                -printf '%h\n' 2>/dev/null |
-            head -n1 ||
-            true
-        )"
-
+    if [[ ${#dirs[@]} -eq 1 ]]; then
+        source_dir="${dirs[0]}"
     fi
 
+    [[ -x "$source_dir/antigravity-ide" ]] || {
+        die "Archive không có executable antigravity-ide."
+    }
 
-    [[ -n "$source" ]] ||
-        die "Archive không chứa executable antigravity-ide."
+    local version
+    version="$(version_from_dir "$source_dir")"
 
+    [[ -n "$version" ]] || {
+        die "Không đọc được version sau khi giải nén."
+    }
 
-    [[ -x "$source/antigravity-ide" ]] ||
-        die "Executable antigravity-ide không hợp lệ."
+    log "Archive version: $version"
 
+    local backup="$TMP_ROOT/old-install"
 
-    local stage="$WORK_DIR/stage"
+    if [[ -d "$INSTALL_DIR" ]]; then
+        log "==> Backup installation hiện tại..."
+        sudo mv "$INSTALL_DIR" "$backup"
+    fi
 
+    log "==> Cài vào $INSTALL_DIR..."
 
-    rm -rf "$stage"
+    sudo mkdir -p "$INSTALL_DIR"
+    sudo cp -a "$source_dir"/. "$INSTALL_DIR"/
 
-    mkdir -p "$stage"
-
-    cp -a "$source"/. "$stage"/
-
-
-    local new_version=""
-
-    new_version="$(
-        version_from_dir "$stage" ||
-        true
-    )"
-
-
-    info "Đang cài vào $APP_DIR..."
-
-
-    sudo mkdir -p "$APP_DIR"
-
-    sudo rm -rf "$APP_DIR"
-
-    sudo cp -a "$stage"/. "$APP_DIR"/
-
-
-    [[ -x "$APP_DIR/antigravity-ide" ]] ||
-        die "Cài đặt thất bại."
-
-
-    if [[ -f "$APP_DIR/chrome-sandbox" ]]; then
-
-        info "Thiết lập Chrome SUID sandbox..."
-
-
-        sudo chown \
-            root:root \
-            "$APP_DIR/chrome-sandbox"
-
-
-        sudo chmod \
-            4755 \
-            "$APP_DIR/chrome-sandbox"
-
-
-        # Fedora + SELinux.
-        if command -v restorecon >/dev/null 2>&1; then
-
-            sudo restorecon \
-                -v \
-                "$APP_DIR/chrome-sandbox" ||
-                true
-
+    if [[ ! -x "$INSTALL_DIR/antigravity-ide" ]]; then
+        if [[ -d "$backup" ]]; then
+            sudo rm -rf "$INSTALL_DIR"
+            sudo mv "$backup" "$INSTALL_DIR"
         fi
 
-    else
-
-        warn "Không tìm thấy chrome-sandbox trong package."
-
+        die "Cài đặt thất bại: không tìm thấy executable."
     fi
 
+    if [[ -f "$INSTALL_DIR/chrome-sandbox" ]]; then
+        log "==> Fix chrome-sandbox..."
 
-    sudo ln \
-        -sfn \
-        "$APP_DIR/antigravity-ide" \
+        sudo chown root:root "$INSTALL_DIR/chrome-sandbox"
+        sudo chmod 4755 "$INSTALL_DIR/chrome-sandbox"
+
+        # Fedora thường dùng SELinux.
+        if command -v restorecon >/dev/null 2>&1; then
+            sudo restorecon -v "$INSTALL_DIR/chrome-sandbox" || true
+        fi
+    else
+        echo "WARNING: Không tìm thấy chrome-sandbox." >&2
+    fi
+
+    log "==> Tạo command $BIN_PATH..."
+
+    sudo ln -sfn \
+        "$INSTALL_DIR/antigravity-ide" \
         "$BIN_PATH"
-
 
     create_desktop_entry
 
-
-    info "Cài đặt hoàn tất."
-
-
-    if [[ -n "$new_version" ]]; then
-
-        echo "Version: $new_version"
-
+    if [[ -d "$backup" ]]; then
+        sudo rm -rf "$backup"
     fi
+
+    log
+    log "=========================================="
+    log "Antigravity IDE đã được cài đặt."
+    log "Version: $version"
+    log "Command: antigravity-ide"
+    log "=========================================="
 }
 
-
 create_desktop_entry() {
-
-    mkdir -p \
-        "$(dirname "$DESKTOP_FILE")"
-
+    mkdir -p "$(dirname "$DESKTOP_FILE")"
 
     local icon=""
 
-
     for candidate in \
-        "$APP_DIR/resources/app/out/media/code-icon.svg" \
-        "$APP_DIR/resources/app/resources/linux/code.png" \
-        "$APP_DIR/resources/app/resources/linux/code.svg"
+        "$INSTALL_DIR/resources/app/out/media/code-icon.svg" \
+        "$INSTALL_DIR/resources/app/resources/linux/code.png" \
+        "$INSTALL_DIR/resources/app/resources/linux/code.svg"
     do
-
         if [[ -f "$candidate" ]]; then
-
             icon="$candidate"
-
             break
-
         fi
-
     done
-
 
     cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
@@ -615,311 +538,117 @@ Exec=$BIN_PATH %F
 Terminal=false
 Type=Application
 Categories=Development;IDE;
+StartupNotify=true
 StartupWMClass=antigravity
 EOF
 
-
     if [[ -n "$icon" ]]; then
-
-        printf \
-            'Icon=%s\n' \
-            "$icon" \
-            >> "$DESKTOP_FILE"
-
+        printf 'Icon=%s\n' "$icon" >> "$DESKTOP_FILE"
     fi
-
 
     chmod +x "$DESKTOP_FILE"
 
-
     if [[ -d "$HOME/Desktop" ]]; then
-
-        cp -f \
-            "$DESKTOP_FILE" \
-            "$DESKTOP_LINK"
-
-        chmod +x \
-            "$DESKTOP_LINK"
-
+        cp -f "$DESKTOP_FILE" "$DESKTOP_SHORTCUT"
+        chmod +x "$DESKTOP_SHORTCUT"
     fi
 }
 
+main() {
+    echo
+    echo "=========================================="
+    echo "       Antigravity IDE Manager"
+    echo "       Fedora / RHEL"
+    echo "=========================================="
+    echo
 
-compare_versions() {
+    install_dependencies
 
-    local a="$1"
-    local b="$2"
+    local current_version
+    current_version="$(installed_version)"
 
-
-    [[ -n "$a" && -n "$b" ]] ||
-        return 2
-
-
-    if command -v python3 >/dev/null 2>&1; then
-
-        python3 - "$a" "$b" <<'PY'
-
-import re
-import sys
-
-
-def version(value):
-
-    return tuple(
-        int(x) if x.isdigit() else x
-        for x in re.findall(
-            r'\d+|[A-Za-z]+',
-            value
-        )
-    )
-
-
-a, b = map(
-    version,
-    sys.argv[1:3]
-)
-
-
-raise SystemExit(
-    0 if a < b else 1
-)
-
-PY
-
-        return
-
-    fi
-
-
-    return 2
-}
-
-
-run_manager() {
-
-    TMP_DIR="$(
-        mktemp -d
-    )"
-
-
-    WORK_DIR="$TMP_DIR/work"
-
-
-    mkdir -p "$WORK_DIR"
-
-
-    local current=""
-
-    current="$(
-        installed_version ||
-        true
-    )"
-
-
-    if [[ -n "$current" ]]; then
-
-        echo
-        echo "Installed version: $current"
-
+    if [[ -n "$current_version" ]]; then
+        echo "Installed version: $current_version"
     else
-
-        echo
-        echo "Antigravity IDE: chưa cài."
-
+        echo "Antigravity IDE: CHƯA CÀI"
     fi
 
+    echo
 
-    local result=""
+    local html
+    html="$(extract_release_page)"
 
-    result="$(
-        discover_release ||
-        true
-    )"
+    echo "==> Đang tìm Antigravity IDE Linux x64..."
+    local latest_url
 
-
-    if [[ -z "$result" ]]; then
-
-        die \
-            "Không tìm thấy artifact Antigravity IDE Linux x64 trên trang releases."
-
-    fi
-
-
-    if [[ "$result" == AMBIGUOUS* ]]; then
-
+    if ! latest_url="$(discover_release "$html")"; then
         echo
-        echo "Có nhiều artifact phù hợp."
-        echo "Script không thể xác định chắc chắn artifact."
-        echo
-        echo "$result"
-
-        exit 2
-
+        echo "Không thể xác định chính xác file tải Antigravity IDE."
+        echo "Script đã dừng để tránh tải nhầm sản phẩm."
+        exit 1
     fi
-
-
-    local latest_url="$result"
-
 
     echo
     echo "Latest artifact:"
     echo "$latest_url"
+    echo
 
+    local archive
+    archive="$(download_latest "$latest_url")"
 
-    local archive=""
+    echo "==> Đang xác định version mới nhất..."
 
-    archive="$(
-        download_latest "$latest_url"
-    )"
+    local latest_version
+    latest_version="$(version_from_archive "$archive")"
 
+    [[ -n "$latest_version" ]] || {
+        die "Không đọc được version từ archive."
+    }
 
-    local extract_preview="$WORK_DIR/preview"
+    echo "Latest version:    $latest_version"
 
-
-    mkdir -p "$extract_preview"
-
-
-    tar \
-        -xzf "$archive" \
-        -C "$extract_preview" ||
-        die "Archive không hợp lệ."
-
-
-    local preview_root="$extract_preview"
-
-
-    if [[ ! -x "$preview_root/antigravity-ide" ]]; then
-
-        local found=""
-
-        found="$(
-            find "$extract_preview" \
-                -mindepth 1 \
-                -maxdepth 2 \
-                -type f \
-                -name antigravity-ide \
-                -printf '%h\n' 2>/dev/null |
-            head -n1 ||
-            true
-        )"
-
-
-        if [[ -n "$found" ]]; then
-
-            preview_root="$found"
-
-        fi
-
-    fi
-
-
-    local latest_version=""
-
-    latest_version="$(
-        version_from_dir "$preview_root" ||
-        true
-    )"
-
-
-    if [[ -n "$current" &&
-          -n "$latest_version" ]]; then
-
-
+    if [[ -n "$current_version" ]]; then
         echo
-        echo "Current version: $current"
-        echo "Latest version:  $latest_version"
 
+        local comparison
+        comparison="$(version_compare "$current_version" "$latest_version")"
 
-        if compare_versions \
-            "$latest_version" \
-            "$current"; then
-
-
-            echo
-
-
-            read -r -p \
-                "Có bản mới. Update Antigravity IDE? [Y/n] " \
-                answer
-
-
-            answer="${answer:-Y}"
-
-
-            [[ "$answer" =~ ^[Yy]$ ]] ||
-            {
-                echo "Đã hủy."
+        case "$comparison" in
+            0)
+                echo "Bạn đang dùng phiên bản mới nhất."
                 exit 0
-            }
+                ;;
 
+            2)
+                echo "Phiên bản đang cài mới hơn artifact trên releases."
+                echo "Không thực hiện downgrade."
+                exit 0
+                ;;
 
-        else
+            1)
+                echo "Có phiên bản mới."
+                echo
+                echo "Installed: $current_version"
+                echo "Latest:    $latest_version"
+                echo
 
-            echo
-            echo "Antigravity IDE đã là bản mới nhất."
-
-            exit 0
-
-        fi
-
-
-    elif [[ -z "$current" ]]; then
-
-
+                if ! confirm "Bạn có muốn update không?"; then
+                    echo "Đã hủy."
+                    exit 0
+                fi
+                ;;
+        esac
+    else
         echo
 
-
-        read -r -p \
-            "Cài Antigravity IDE? [Y/n] " \
-            answer
-
-
-        answer="${answer:-Y}"
-
-
-        [[ "$answer" =~ ^[Yy]$ ]] ||
-        {
+        if ! confirm "Antigravity IDE chưa được cài. Cài phiên bản $latest_version không?"; then
             echo "Đã hủy."
             exit 0
-        }
-
-
-    else
-
-
-        warn \
-            "Không so sánh được version tự động."
-
-
-        read -r -p \
-            "Tiếp tục cài/update artifact này? [y/N] " \
-            answer
-
-
-        [[ "$answer" =~ ^[Yy]$ ]] ||
-        {
-            echo "Đã hủy."
-            exit 0
-        }
-
+        fi
     fi
 
-
+    echo
     install_archive "$archive"
-
-
-    echo
-    echo "======================================"
-    echo "      Antigravity IDE READY"
-    echo "======================================"
-    echo
-    echo "Chạy bằng:"
-    echo
-    echo "  antigravity-ide"
-    echo
 }
 
-
-install_dependencies
-
-run_manager "$@"
+main "$@"
