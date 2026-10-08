@@ -1,57 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BASE_URL="https://raw.githubusercontent.com/Fin12n/Linux/refs/heads/main/Antigravity/scripts"
 
-UBUNTU_SCRIPT="$SCRIPT_DIR/install-ubuntu.sh"
-FEDORA_SCRIPT="$SCRIPT_DIR/install-fedora.sh"
-
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
-
-[[ -f /etc/os-release ]] || die "Không tìm thấy /etc/os-release."
-
-# shellcheck disable=SC1091
+# Detect OS
 source /etc/os-release
 
-ID_LIKE="${ID_LIKE:-}"
-ID="${ID:-}"
-
-echo
-echo "======================================"
-echo "      Antigravity IDE Installers"
-echo "======================================"
-echo
-echo "Detected OS: ${PRETTY_NAME:-$ID}"
-echo
-
 case "$ID" in
+
     ubuntu|debian|linuxmint|pop|elementary|zorin)
-        exec bash "$UBUNTU_SCRIPT" "$@"
+        SCRIPT_URL="$BASE_URL/install-ubuntu.sh"
         ;;
 
-    fedora)
-        exec bash "$FEDORA_SCRIPT" "$@"
+    fedora|rhel|centos|rocky|almalinux)
+        SCRIPT_URL="$BASE_URL/install-fedora.sh"
         ;;
 
-    rhel|centos|rocky|almalinux)
-        if [[ "$ID_LIKE" == *fedora* ||
-              "$ID_LIKE" == *rhel* ||
-              "$ID_LIKE" == *centos* ]]; then
-            exec bash "$FEDORA_SCRIPT" "$@"
+    *)
+        if [[ "${ID_LIKE:-}" == *debian* ]]; then
+            SCRIPT_URL="$BASE_URL/install-ubuntu.sh"
+
+        elif [[ "${ID_LIKE:-}" == *fedora* ||
+                "${ID_LIKE:-}" == *rhel* ]]; then
+            SCRIPT_URL="$BASE_URL/install-fedora.sh"
+
+        else
+            echo "ERROR: OS chưa được hỗ trợ."
+            exit 1
         fi
         ;;
-
 esac
 
-if [[ "$ID_LIKE" == *debian* ]]; then
-    exec bash "$UBUNTU_SCRIPT" "$@"
+echo "Detected OS: ${PRETTY_NAME:-$ID}"
+echo "Downloading installer..."
 
-elif [[ "$ID_LIKE" == *fedora* ||
-        "$ID_LIKE" == *rhel* ]]; then
-    exec bash "$FEDORA_SCRIPT" "$@"
-fi
-
-die "Distro chưa được hỗ trợ: ID=$ID, ID_LIKE=$ID_LIKE"
+exec bash <(
+    curl -fsSL "$SCRIPT_URL"
+)
